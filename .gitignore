@@ -1,0 +1,12 @@
+# 白名单模式：默认全部忽略，只放行以下内容
+/*
+!/.gitignore
+!/server.py
+!/Dockerfile
+!/static/
+!/.github/
+
+# 兜底排除
+__pycache__/
+*.log
+*.pyc

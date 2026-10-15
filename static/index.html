@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pangen 生图工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◐</span>
+    <div class="brand-name">Pangen 生图工作台<small>IMAGE STUDIO</small></div>
+  </div>
+  <div class="top-meta">
+    <span class="chip"><span class="dot"></span>服务运行中</span>
+    <span class="chip">存储 <code>D:\PangenImages</code></span>
+    <span class="chip" id="task-stats"></span>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ============ 左：控制面板 ============ -->
+  <aside class="panel controls">
+    <div class="mode-tabs" role="tablist">
+      <button class="tab active" data-mode="t2i" role="tab" aria-selected="true">文生图</button>
+      <button class="tab" data-mode="i2i" role="tab" aria-selected="false">图生图</button>
+      <button class="tab" data-mode="inpaint" role="tab" aria-selected="false">局部改图</button>
+    </div>
+
+    <label class="field"><span>模型</span><select id="model"></select></label>
+
+    <div class="field-row">
+      <label class="field"><span>尺寸比例 <i style="font-style:normal;color:#A9A79F">接口固定档位</i></span>
+        <select id="size">
+          <option value="1024x1024">1:1 · 1024×1024</option>
+          <option value="1536x1024">3:2 横 · 1536×1024</option>
+          <option value="1024x1536">2:3 竖 · 1024×1536</option>
+          <option value="auto">自动</option>
+        </select>
+      </label>
+      <label class="field"><span>张数</span>
+        <select id="count">
+          <option>1</option><option>2</option><option>3</option><option>4</option>
+        </select>
+      </label>
+      <label class="field"><span>质量</span>
+        <select id="quality">
+          <option value="">自动</option>
+          <option value="high">high</option>
+          <option value="medium">medium</option>
+          <option value="low">low</option>
+        </select>
+      </label>
+    </div>
+
+    <label class="field"><span>提示词</span>
+      <textarea id="prompt" placeholder="描述你想要的画面：主体、风格、构图、光影、色彩…&#10;例：一只戴圣诞帽的橘猫，坐毛毯上，暖光，写实风格"></textarea>
+    </label>
+
+    <!-- 图生图：参考图 -->
+    <div id="ref-zone" class="inpaint-box" hidden>
+      <div class="dropzone" id="ref-drop" role="button" tabindex="0" aria-label="添加参考图，点击或拖入">
+        <span class="icon">＋</span>
+        <div class="hint">点击或拖入参考图（可多张）</div>
+        <div class="ref-count">已添加 <b id="ref-count">0</b> 张参考图</div>
+        <input type="file" id="ref-input" accept="image/*" multiple hidden>
+      </div>
+      <div class="thumbs" id="ref-thumbs"></div>
+    </div>
+
+    <!-- 局部改图：底图 + 蒙版画布 -->
+    <div id="inpaint-zone" hidden>
+      <div class="dropzone" id="base-drop" role="button" tabindex="0" aria-label="上传底图">
+        <span class="icon">＋</span>
+        <div class="hint">点击上传要修改的底图</div>
+        <input type="file" id="base-input" accept="image/*" hidden>
+      </div>
+      <div id="mask-editor" hidden>
+        <div class="mask-wrap"><canvas id="mask-canvas"></canvas></div>
+        <div class="inpaint-tools">
+          <span>笔刷 <input type="range" id="brush" min="8" max="120" value="40"></span>
+          <button class="link-btn" id="mask-clear" type="button">清空涂抹</button>
+          <button class="link-btn" id="mask-invert-tip" type="button" title="涂抹的区域 = 要重绘的区域">? 涂哪里改哪里</button>
+        </div>
+      </div>
+    </div>
+
+    <button id="generate" class="btn-primary">生 成</button>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </aside>
+
+  <!-- ============ 中：结果舞台 ============ -->
+  <section class="stage" id="stage">
+    <div class="placeholder">
+      <div class="ph-icon">◐</div>
+      生成的图片会显示在这里<br>左侧填写提示词开始创作
+    </div>
+  </section>
+
+  <!-- ============ 右：任务记录 ============ -->
+  <aside class="panel history">
+    <h2>任务记录 <button class="link-btn" id="refresh" type="button">刷新</button></h2>
+    <div class="task-list" id="task-list">
+      <div class="empty"><span class="ph-icon">◇</span>暂无任务</div>
+    </div>
+  </aside>
+</main>
+
+<div id="lightbox" hidden><img alt="预览大图"></div>
+
+<!-- 访问口令门 -->
+<div id="gate" hidden>
+  <div class="gate-card">
+    <div class="gate-logo">◐</div>
+    <h1>Pangen 生图工作台</h1>
+    <p>请输入访问口令</p>
+    <input type="password" id="gate-code" placeholder="访问口令" autocomplete="off">
+    <button id="gate-submit" type="button">进入</button>
+    <div id="gate-err" class="gate-err"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
