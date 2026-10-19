@@ -43,6 +43,7 @@ CHAT_MODEL = os.environ.get("PANGEN_CHAT_MODEL", CHAT_MODELS[0])
 MAX_REFS = 6
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024   # 单次请求体上限
 VISION_INLINE_LIMIT = 4 * 1024 * 1024  # 超过此体积的图不塞进多模态上下文
+IMAGE_DEADLINE = 420                   # 生图响应（几 MB base64）的最长下载时间
 
 # 多口令 + 每日限额：PANGEN_CODES="owner:CODE1:0,friend:CODE2:30"
 # 格式 标签:口令:每日张数（0=不限量）；label 为 owner 的口令可见并管理全部任务
@@ -147,11 +148,14 @@ def quota_block(client, n):
 _OPENER = urllib.request.build_opener()
 
 
-def relay_request(path, body, headers, timeout=TIMEOUT, retries=2):
+def relay_request(path, body, headers, timeout=TIMEOUT, retries=2, deadline=0):
     """调用中转。
 
     连接层失败（TLS 握手超时 / 连接被拒）时请求还没送达上游，重试不会造成重复扣费，
     因此这类失败无论耗时多久都重试；已建立连接后的读超时不重试。
+
+    deadline > 0 时限制整个响应的最长下载时间——生图接口返回几 MB base64，
+    网络差时会慢速滴流，单靠 socket timeout 拦不住。
     """
     last = "未知错误"
     for attempt in range(retries + 1):
@@ -162,9 +166,20 @@ def relay_request(path, body, headers, timeout=TIMEOUT, retries=2):
                      "Accept": "application/json", **headers},
             method="POST")
         t0 = time.time()
+        hard_stop = t0 + deadline if deadline else 0
         try:
             with _OPENER.open(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8")), None
+                if not hard_stop:
+                    return json.loads(resp.read().decode("utf-8")), None
+                buf = bytearray()
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if time.time() > hard_stop:
+                        raise RuntimeError("下载超时：响应超过 %d 秒仍未传完" % deadline)
+                return json.loads(buf.decode("utf-8")), None
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:300]
             return None, "HTTP %s: %s" % (e.code, detail)
@@ -298,7 +313,8 @@ def run_generation(task_id, mode, fields, files=None, client_label=""):
                 payload["quality"] = fields["quality"]
             body = json.dumps(payload).encode("utf-8")
             data, err = relay_request("/images/generations", body,
-                                      {"Content-Type": "application/json"})
+                                      {"Content-Type": "application/json"},
+                                      deadline=IMAGE_DEADLINE)
         else:
             mp_fields = {"model": fields["model"], "prompt": fields["prompt"],
                          "size": fields.get("size", "auto"),
@@ -309,7 +325,8 @@ def run_generation(task_id, mode, fields, files=None, client_label=""):
             if files.get("mask"):
                 relay_files.append(("mask", "mask.png", files["mask"]))
             body, ctype = build_relay_multipart(mp_fields, relay_files)
-            data, err = relay_request("/images/edits", body, {"Content-Type": ctype})
+            data, err = relay_request("/images/edits", body, {"Content-Type": ctype},
+                                      deadline=IMAGE_DEADLINE)
         if err:
             raise RuntimeError(err)
         saved = save_result_images(data.get("data", []))

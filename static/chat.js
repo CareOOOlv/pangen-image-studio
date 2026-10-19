@@ -812,7 +812,9 @@
     s.title = '冬季拼图地垫场景图';
     s.messages = [
       { id: uid(), role: 'user', at: Date.now() - 42000,
-        text: '按这个场景出一版：冬季拼图地垫，儿童房木地板，暖光，俯拍，电商主图风格' },
+        text: '按这个场景出一版：冬季拼图地垫，儿童房木地板，暖光，俯拍，电商主图风格',
+        imgs: ['20261004-141619-1.png', '20261004-140836-1.png', '20261004-140649-1.png']
+          .map(mediaUrl) },
       { id: uid(), role: 'assistant', at: Date.now() - 12000,
         text: '已按冬季儿童房场景出图，暖光俯拍，保留拼图纹理，可点击放大看细节。',
         images: state.demoImages && state.demoImages.length
@@ -852,6 +854,7 @@
       if (ok && new URLSearchParams(location.search).has('demo')) {
         seedDemo();
         renderAll();
+        setTimeout(() => { const st = $('stream'); if (st) st.scrollTop = 0; }, 120);
       }
       if (ok && urlCode) {
         try { history.replaceState(null, '', location.pathname); } catch {}
