@@ -457,8 +457,11 @@
       try {
         const blob = await downscale(f, 1400, 0.9);
         const thumbBlob = await downscale(f, 256, 0.82);
+        // 另存一张 640px 的「阅读版」：只给编排模型看，体积约原图 1/6，
+        // 上游带宽紧张时能把读图耗时压下来，避免整轮超时
+        const readBlob = await downscale(f, 640, 0.8);
         state.refs.push({
-          id: uid(), blob, url: URL.createObjectURL(blob),
+          id: uid(), blob, url: URL.createObjectURL(blob), read: readBlob,
           thumb: await blobToDataURL(thumbBlob),
         });
       } catch (e) {
@@ -604,20 +607,24 @@
     fd.append('n', String(state.count));
     fd.append('history', JSON.stringify(history));
     refs.forEach((r, i) => fd.append('images', r.blob, 'ref-' + (i + 1) + '.jpg'));
+    refs.forEach((r, i) => { if (r.read) fd.append('thumbs', r.read, 'read-' + (i + 1) + '.jpg'); });
 
     state.abort = new AbortController();
     try {
       const r = await api('/api/chat', { method: 'POST', body: fd, signal: state.abort.signal });
       const data = await r.json().catch(() => ({}));
       const now = Date.now();
+      // 后端失败时 error 可能是字符串（具体原因）或旧版的布尔 true，两种都得显示成人话
+      const reason = typeof data.error === 'string' ? data.error.trim() : '';
       if (!r.ok) {
         if (r.status === 401) { state.busy = false; renderStream(); showGate('口令已失效，请重新输入'); return; }
         if (r.status === 429) {
           s.messages.push({ id: uid(), role: 'assistant', at: now, text: '', quota: data.error || '今日额度已用完' });
           state.usage = data.usage || state.usage;
         } else {
-          s.messages.push({ id: uid(), role: 'assistant', at: now, text: '',
-            error: data.error || ('请求失败 HTTP ' + r.status) });
+          s.messages.push({ id: uid(), role: 'assistant', at: now,
+            text: data.reply || '',
+            error: reason || (data.error ? '请求失败 HTTP ' + r.status : '') });
         }
       } else {
         const imgs = data.images || [];
@@ -638,8 +645,8 @@
           msg.quota = data.reply || '今日额度已用完';
           msg.text = '';
         } else if (data.error && !imgs.length) {
-          msg.error = (t && t.error) || '生成失败，请稍后重试';
-          msg.text = '';
+          msg.error = reason || (t && typeof t.error === 'string' && t.error)
+            || '生成失败，请稍后重试';
         }
         s.messages.push(msg);
         if (data.usage) state.usage = data.usage;

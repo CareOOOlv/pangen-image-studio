@@ -5,6 +5,7 @@
 import base64
 import email.message
 import email.policy
+import http.client
 import json
 import mimetypes
 import os
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +43,12 @@ CHAT_MODELS = ["gpt-6-luna", "gpt-5.6-luna", "gpt-6", "gpt-5.6"]
 CHAT_MODEL = os.environ.get("PANGEN_CHAT_MODEL", CHAT_MODELS[0])
 # 编排模型正常 4~10s 就有结果，25s 足够；竞速时超了立刻换人，绝不死等
 CHAT_TIMEOUT = 25
+# 带参考图时要先读图，单独给一档超时。
+# 只送 640px 小图时实测 4~5s 就能出结论，40s 已是 8 倍余量，再长只是让用户干等。
+VISION_TIMEOUT = 40
+# 视觉环节优先用前端另存的小图（~640px），体积只有原图 1/6，
+# 上游带宽有限时这是「读图慢 → 超时」的最有效解法
+VISION_PREFER_THUMB = True
 
 # 参考图上限（前后端一致）
 MAX_REFS = 6
@@ -77,7 +85,6 @@ def ensure_dirs():
         with open(TASKS_FILE, "w", encoding="utf-8") as f:
             json.dump([], f)
 
-
 def load_tasks():
     with _lock:
         if not os.path.exists(TASKS_FILE):
@@ -85,12 +92,10 @@ def load_tasks():
         with open(TASKS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
 
-
 def save_tasks(tasks):
     with _lock:
         with open(TASKS_FILE, "w", encoding="utf-8") as f:
             json.dump(tasks, f, ensure_ascii=False, indent=1)
-
 
 def upsert_task(task):
     tasks = load_tasks()
@@ -98,14 +103,11 @@ def upsert_task(task):
     tasks.insert(0, task)
     save_tasks(tasks)
 
-
 # ---------- 用量统计（按口令标签每日计数） ----------
 USAGE_FILE = os.path.join(STORAGE_DIR, "usage.json")
 
-
 def _today():
     return time.strftime("%Y-%m-%d")
-
 
 def load_usage():
     try:
@@ -113,7 +115,6 @@ def load_usage():
             return json.load(f)
     except Exception:
         return {}
-
 
 def add_usage(label, n):
     with _lock:
@@ -126,13 +127,11 @@ def add_usage(label, n):
         with open(USAGE_FILE, "w", encoding="utf-8") as f:
             json.dump(usage, f, ensure_ascii=False, indent=1)
 
-
 def quota_of(client):
     used = load_usage().get(_today(), {}).get(client["label"], 0)
     limit = client["limit"]
     return {"label": client["label"], "date": _today(), "used": used,
             "limit": limit, "remaining": None if limit <= 0 else max(0, limit - used)}
-
 
 def quota_block(client, n):
     """返回 None 表示放行；否则返回拒绝原因文案。"""
@@ -144,65 +143,176 @@ def quota_block(client, n):
                 % (used, client["limit"]))
     return None
 
-
 # ---------- 中转 API ----------
-# 走系统默认的网络路径（有 http(s)_proxy 就用代理——云端无代理时自动直连）。
-# 注意：不要用 ProxyHandler({}) 强制直连，某些沙箱只放行代理出口，直连会卡在 TLS 握手。
-_OPENER = urllib.request.build_opener()
+# 出网路径默认「直连优先，连不上再退回系统代理」，PANGEN_NET_MODE=direct|proxy 可强制。
+# 2026-10-19 实测本机：直连基本可用（1.6~3.5s），系统代理 127.0.0.1:8337 多次整条挂死，
+# 所以代理只作兜底，不再当默认路径。
+NET_MODE = os.environ.get("PANGEN_NET_MODE", "auto").strip().lower()
+_OPENER_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_OPENER_PROXY = urllib.request.build_opener()
 
+def _opener_routes():
+    """给非复用的普通 GET（下载结果图）用。"""
+    if NET_MODE == "direct":
+        return [_OPENER_DIRECT]
+    if NET_MODE == "proxy":
+        return [_OPENER_PROXY]
+    return [_OPENER_DIRECT, _OPENER_PROXY]
 
-def relay_request(path, body, headers, timeout=TIMEOUT, retries=2, deadline=0):
+_BASE = urllib.parse.urlparse(BASE_URL)
+_HOST = _BASE.hostname or "codex.pangen.dev"
+_PORT = _BASE.port or 443
+_BASE_PATH = _BASE.path.rstrip("/")
+# TLS 握手实测一半概率卡死，且卡住后就一直挂到超时。握手超过 8 秒基本无望，
+# 与其等到 25 秒，不如早断早重试——4 次 8 秒的组合成功率远高于 1 次 25 秒。
+CONNECT_TIMEOUT = 8
+
+def _route_order():
+    if NET_MODE == "proxy":
+        return ["proxy"]
+    if NET_MODE == "direct":
+        return ["direct"]
+    return ["direct", "proxy"]
+
+# 连接复用：每次请求都重新做一次 TLS 握手，在抖动链路上就是一次次掷骰子
+# （实测握手 0.5s 到直接 60s 超时）。同一线程内复用连接，成功一次之后基本不用再握手。
+_TLS = threading.local()
+
+def _proxy_target():
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return None
+    raw = proxies.get("https") or proxies.get("http")
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    u = urllib.parse.urlparse(raw)
+    if not u.hostname:
+        return None
+    return (u.hostname, u.port or 8080)
+
+def _conn_for(kind, timeout):
+    """取（必要时新建）当前线程在该路径上的连接。返回 (conn, fresh)。
+
+    新建的连接只带握手超时，连上之后由调用方把 socket 超时换成读写超时——
+    握手卡住 8 秒基本就是死透了，等 25 秒只是让用户白等。
+    """
+    store = getattr(_TLS, "conns", None)
+    if store is None:
+        store = _TLS.conns = {}
+    conn = store.get(kind)
+    if conn is not None and conn.sock is None:
+        store.pop(kind, None)
+        conn = None
+    fresh = conn is None
+    if fresh:
+        if kind == "direct":
+            conn = http.client.HTTPSConnection(_HOST, _PORT, timeout=timeout)
+        else:
+            tgt = _proxy_target()
+            if not tgt:
+                return None, True
+            conn = http.client.HTTPSConnection(tgt[0], tgt[1], timeout=timeout)
+            conn.set_tunnel(_HOST, _PORT)
+        store[kind] = conn
+    return conn, fresh
+
+def _drop_conn(kind):
+    store = getattr(_TLS, "conns", None) or {}
+    conn = store.pop(kind, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def relay_request(path, body, headers, timeout=TIMEOUT, retries=3, deadline=0):
     """调用中转。
 
     连接层失败（TLS 握手超时 / 连接被拒）时请求还没送达上游，重试不会造成重复扣费，
-    因此这类失败无论耗时多久都重试；已建立连接后的读超时不重试。
+    因此这类失败无论耗时多久都重试，并且换一条出网路径再试；
+    连接已复用、请求可能已送达之后的超时不重试也不换路径——重发会重复扣费。
 
     deadline > 0 时限制整个响应的最长下载时间——生图接口返回几 MB base64，
     网络差时会慢速滴流，单靠 socket timeout 拦不住。
     """
-    last = "未知错误"
-    for attempt in range(retries + 1):
-        req = urllib.request.Request(
-            BASE_URL.rstrip("/") + path, data=body,
-            headers={"Authorization": "Bearer " + API_KEY,
-                     "User-Agent": UA,
-                     "Accept": "application/json", **headers},
-            method="POST")
-        t0 = time.time()
-        hard_stop = t0 + deadline if deadline else 0
-        try:
-            with _OPENER.open(req, timeout=timeout) as resp:
-                if not hard_stop:
-                    return json.loads(resp.read().decode("utf-8")), None
-                buf = bytearray()
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if time.time() > hard_stop:
-                        raise RuntimeError("下载超时：响应超过 %d 秒仍未传完" % deadline)
-                return json.loads(buf.decode("utf-8")), None
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")[:300]
-            return None, "HTTP %s: %s" % (e.code, detail)
-        except urllib.error.URLError as e:
-            last = "网络错误: %s" % e.reason
-        except Exception as e:
-            last = "请求失败: %s" % e
+    url_path = _BASE_PATH + path
+    hdr = {"Authorization": "Bearer " + API_KEY, "User-Agent": UA,
+           "Accept": "application/json", "Content-Type": "application/json"}
+    hdr.update(headers)
 
-        elapsed = time.time() - t0
-        connect_level = ("handshake" in last or "refused" in last
-                         or "10061" in last or "getaddrinfo" in last
-                         or "Connection reset" in last or elapsed < 8)
-        sys.stderr.write("[relay] %s 失败(%.1fs, 可重试=%s): %s\n"
-                         % (path, elapsed, connect_level, last[:120]))
-        if attempt < retries and connect_level:
-            time.sleep(1.2)
+    routes = _route_order()
+    last = "未知错误"
+    for ri, kind in enumerate(routes):
+        connect_level = True
+        for attempt in range(retries + 1):
+            t0 = time.time()
+            hard_stop = t0 + deadline if deadline else 0
+
+            # 第一段：建立连接。失败说明请求根本没送出去，重试不会重复扣费。
+            try:
+                conn, fresh = _conn_for(kind, CONNECT_TIMEOUT)
+                if conn is None:
+                    last = "网络错误: 没有可用的代理"
+                    connect_level = False
+                    break
+                if conn.sock is None:
+                    conn.connect()               # 只受 CONNECT_TIMEOUT 约束
+            except Exception as e:
+                _drop_conn(kind)
+                last = "连接失败: %s" % e
+                connect_level = True
+                elapsed = time.time() - t0
+                sys.stderr.write("[relay] %s 失败(%s, %.1fs, 可重试=True): %s\n"
+                                 % (path, "直连" if kind == "direct" else "代理",
+                                    elapsed, str(last)[:120]))
+                if attempt < retries:
+                    time.sleep(0.8)
+                    continue
+                break
+
+            # 第二段：请求已发出去，之后的超时不再重试（可能已受理，重发会重复扣费）
+            try:
+                conn.sock.settimeout(timeout)    # 连上后换成读写超时
+                conn.request("POST", url_path, body=body, headers=hdr)
+                resp = conn.getresponse()
+                if resp.status >= 400:
+                    detail = resp.read().decode("utf-8", errors="replace")[:300]
+                    _drop_conn(kind)
+                    return None, "HTTP %s: %s" % (resp.status, detail)
+                if not hard_stop:
+                    raw = resp.read()
+                else:
+                    buf = bytearray()
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        if time.time() > hard_stop:
+                            raise RuntimeError("下载超时：响应超过 %d 秒仍未传完" % deadline)
+                    raw = bytes(buf)
+                if resp.will_close:
+                    _drop_conn(kind)
+                return json.loads(raw.decode("utf-8")), None
+            except Exception as e:
+                last = "请求失败: %s" % e
+                _drop_conn(kind)
+
+            elapsed = time.time() - t0
+            connect_level = False
+            sys.stderr.write("[relay] %s 失败(%s, %.1fs, 可重试=False): %s\n"
+                             % (path, "直连" if kind == "direct" else "代理",
+                                elapsed, str(last)[:120]))
+            break
+        # 只有连接层失败才换路径；读超时优先当成上游慢，不重复提交
+        if connect_level and ri < len(routes) - 1:
+            sys.stderr.write("[relay] 换备用出网路径重试 %s\n" % path)
             continue
         break
     return None, last
-
 
 def relay_chat(messages, tools=None, timeout=150, model=None):
     """调用对话补全（OpenAI 兼容）。返回 (data, err)。"""
@@ -212,7 +322,6 @@ def relay_chat(messages, tools=None, timeout=150, model=None):
         payload["tool_choice"] = "auto"
     return relay_request("/chat/completions", json.dumps(payload).encode("utf-8"),
                          {"Content-Type": "application/json"}, timeout=timeout)
-
 
 def mime_from_bytes(raw):
     if raw[:8] == b"\x89PNG\r\n\x1a\n":
@@ -224,7 +333,6 @@ def mime_from_bytes(raw):
     if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
         return "image/webp"
     return "image/png"
-
 
 def build_relay_multipart(fields, files):
     """files: list of (field_name, filename, data_bytes[, content_type])"""
@@ -242,7 +350,6 @@ def build_relay_multipart(fields, files):
         buf += data + b"\r\n"
     buf += ("--%s--\r\n" % boundary).encode("utf-8")
     return bytes(buf), "multipart/form-data; boundary=%s" % boundary
-
 
 def parse_multipart(body, content_type):
     msg = email.message.Message()
@@ -267,7 +374,6 @@ def parse_multipart(body, content_type):
             fields[name] = payload.decode("utf-8", errors="replace")
     return fields, files
 
-
 def ext_from_bytes(raw):
     if raw[:8] == b"\x89PNG\r\n\x1a\n":
         return ".png"
@@ -279,18 +385,28 @@ def ext_from_bytes(raw):
         return ".webp"
     return ".png"
 
-
 def save_result_images(data_list):
     saved = []
     ts = time.strftime("%Y%m%d-%H%M%S")
+    openers = _opener_routes()
     for i, item in enumerate(data_list):
         if item.get("b64_json"):
             raw = base64.b64decode(item["b64_json"])
         elif item.get("url"):
-            with _OPENER.open(
-                    urllib.request.Request(item["url"], headers={"User-Agent": UA}),
-                    timeout=120) as r:
-                raw = r.read()
+            raw = None
+            for op in openers:
+                try:
+                    with op.open(
+                            urllib.request.Request(item["url"], headers={"User-Agent": UA}),
+                            timeout=120) as r:
+                        raw = r.read()
+                    if raw:
+                        break
+                except Exception as e:
+                    sys.stderr.write("[img] 下载结果图失败(%s): %s\n"
+                                     % ("直连" if op is _OPENER_DIRECT else "代理", e))
+            if not raw:
+                continue
         else:
             continue
         fname = "%s-%d%s" % (ts, i + 1, ext_from_bytes(raw))
@@ -299,7 +415,6 @@ def save_result_images(data_list):
             f.write(raw)
         saved.append(fname)
     return saved
-
 
 def run_generation(task_id, mode, fields, files=None, client_label=""):
     """执行生成并更新任务状态。mode: t2i | i2i | inpaint"""
@@ -345,7 +460,6 @@ def run_generation(task_id, mode, fields, files=None, client_label=""):
     upsert_task(task)
     return task
 
-
 # ---------- 对话编排（LLM 输出结构化指令 → 执行生图） ----------
 # 说明：本中转的对话模型对 tools 参数支持不稳定（带 tools 会挂起），
 # 因此改成让模型直接输出 JSON 指令，服务端解析后执行，链路更稳也更快。
@@ -368,7 +482,6 @@ CHAT_SYSTEM = """你是 Pangen 生图工作台的助手，服务电商卖家的�
 
 ALLOWED_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 
-
 def _extract_json(text):
     """从模型输出里抠出第一个完整 JSON 对象。"""
     if not text:
@@ -387,7 +500,6 @@ def _extract_json(text):
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
-
 
 def _strip_vision(messages):
     """去掉多模态图片，只留文字（模型不支持读图时的降级）。"""
@@ -408,7 +520,6 @@ def _strip_vision(messages):
             out.append(m)
     return out
 
-
 def _chat_once(model, messages, timeout, vision_ok=True):
     """单次编排调用，返回统一结构（不管成功失败）"""
     t0 = time.time()
@@ -419,7 +530,6 @@ def _chat_once(model, messages, timeout, vision_ok=True):
     text = ((data["choices"][0].get("message") or {}).get("content") or "").strip()
     return {"model": model, "err": None, "plan": _extract_json(text), "text": text,
             "vision": vision_ok, "cost": round(time.time() - t0, 1)}
-
 
 def chat_round(messages):
     """并行竞速编排。
@@ -437,11 +547,12 @@ def chat_round(messages):
         use_plain = multi and i > 0
         jobs.append((model, plain if use_plain else messages, not use_plain))
 
+    timeout = VISION_TIMEOUT if multi else CHAT_TIMEOUT
     q = queue.Queue()
 
     def worker(model, msgs, vision_ok):
         try:
-            q.put(_chat_once(model, msgs, CHAT_TIMEOUT, vision_ok))
+            q.put(_chat_once(model, msgs, timeout, vision_ok))
         except Exception as e:
             q.put({"model": model, "err": "请求异常: %s" % e, "plan": None,
                    "text": "", "vision": vision_ok, "cost": 0})
@@ -449,7 +560,7 @@ def chat_round(messages):
     for model, msgs, vok in jobs:
         threading.Thread(target=worker, args=(model, msgs, vok), daemon=True).start()
 
-    deadline = time.time() + CHAT_TIMEOUT + 3
+    deadline = time.time() + timeout + 3
     got, first = 0, None
     while got < len(jobs):
         remain = deadline - time.time()
@@ -466,7 +577,6 @@ def chat_round(messages):
             first = r
     return first or {"model": CHAT_MODEL, "err": "编排模型无响应", "plan": None,
                      "text": "", "vision": True, "cost": 0}
-
 
 def exec_plan(plan, client, img_model, img_files):
     """按模型给的指令执行生图。返回 (task, err)。"""
@@ -497,8 +607,7 @@ def exec_plan(plan, client, img_model, img_files):
                               client_label=client["label"]), None
     return run_generation(task_id, "t2i", fields, client_label=client["label"]), None
 
-
-def run_chat(client, fields, img_files):
+def run_chat(client, fields, img_files, vision_files=None):
     """一轮对话：LLM 决策 →（需要时）执行生图 → 返回文案与图片。"""
     message = (fields.get("message") or "").strip()
     img_model = fields.get("model") or DEFAULT_MODEL
@@ -517,6 +626,10 @@ def run_chat(client, fields, img_files):
         history = []
 
     img_files = img_files[:MAX_REFS]
+    if VISION_PREFER_THUMB and vision_files and len(vision_files) == len(img_files):
+        vis_files = vision_files[:MAX_REFS]
+    else:
+        vis_files = img_files
     q = quota_of(client)
     quota_txt = ("口令不限量" if q["limit"] <= 0
                  else "今日已用 %d/%d 张，剩 %d 张" % (q["used"], q["limit"], q["remaining"]))
@@ -538,7 +651,7 @@ def run_chat(client, fields, img_files):
     user_parts = []
     if message:
         user_parts.append({"type": "text", "text": message})
-    for fn, data in img_files:
+    for fn, data in vis_files:
         if len(data) <= VISION_INLINE_LIMIT:
             user_parts.append({"type": "image_url", "image_url": {
                 "url": "data:%s;base64,%s" % (mime_from_bytes(data),
@@ -563,8 +676,16 @@ def run_chat(client, fields, img_files):
             "chat_model": res["model"], "vision": res.get("vision", True),
             "refs": len(img_files)}
 
+    # 编排模型没给出可用指令时，只要用户既给了图又给了文字，就直接执行。
+    # 一次读图超时不该把整轮请求判死 —— 这是「带图就失败」的根因。
+    if not plan and img_files and message:
+        plan = {"action": "edit", "prompt": message[:1200],
+                "size": pref_size, "n": pref_n, "reply": "", "_fallback": True}
+        sys.stderr.write("[chat] 编排失败，降级直连改图（提示词未优化）\n")
+
     if not plan and not text:
-        base.update({"reply": "对话服务暂时不可用：%s" % (res.get("err") or "无响应")[:160],
+        base.update({"reply": "对话服务暂时不可用（%s）。把画面要求直接用文字写清楚再发一次，"
+                              "我不走编排、直接出图。" % (res.get("err") or "无响应")[:120],
                      "error": True, "chat_model": CHAT_MODEL})
         return base
 
@@ -590,13 +711,17 @@ def run_chat(client, fields, img_files):
     base["action"] = action
     if task.get("status") == "done" and task.get("images"):
         base["images"] = task["images"]
-        base["reply"] = reply or ("已生成 %d 张，看看效果。" % len(task["images"]))
+        if reply:
+            base["reply"] = reply
+        elif plan.get("_fallback"):
+            base["reply"] = "编排模型这次没响应，我直接拿你的原话当提示词出图了。"
+        else:
+            base["reply"] = "已生成 %d 张，看看效果。" % len(task["images"])
     else:
         base["reply"] = ""
-        base["error"] = True
+        base["error"] = task.get("error") or "生成失败，请稍后重试"
     base["usage"] = quota_of(client)
     return base
-
 
 # ---------- HTTP Handler ----------
 class Handler(BaseHTTPRequestHandler):
@@ -702,11 +827,13 @@ class Handler(BaseHTTPRequestHandler):
                 files = []
             img_files = [(fn, data) for (name, fn, data) in files
                          if name in ("images", "images[]", "image[]", "image")]
+            vision_files = [(fn, data) for (name, fn, data) in files
+                            if name in ("thumbs", "thumbs[]", "thumb[]", "thumb")]
             if len(img_files) > MAX_REFS:
                 return self._json(400, {"error": "参考图最多 %d 张" % MAX_REFS})
             if not (fields.get("message") or "").strip() and not img_files:
                 return self._json(400, {"error": "消息不能为空"})
-            result = run_chat(client, fields, img_files)
+            result = run_chat(client, fields, img_files, vision_files)
             return self._json(200 if not result.get("error") else 502, result)
 
         if path == "/api/generate":
@@ -768,7 +895,6 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(404, {"error": "not found"})
 
-
 def main():
     ensure_dirs()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
@@ -777,7 +903,6 @@ def main():
              ", ".join("%s(limit=%d)" % (c["label"], c["limit"]) for c in CLIENTS)
              or "none"))
     srv.serve_forever()
-
 
 if __name__ == "__main__":
     main()
