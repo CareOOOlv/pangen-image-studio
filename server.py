@@ -8,6 +8,7 @@ import email.policy
 import json
 import mimetypes
 import os
+import queue
 import sys
 import threading
 import time
@@ -35,9 +36,11 @@ ACCESS_CODE = os.environ.get("ACCESS_CODE", "")  # 旧变量：单口令不限�
 
 DEFAULT_MODEL = "gpt-image-2"
 
-# 对话编排模型：优先 6-luna，不可用自动降级
+# 对话编排模型：优先 6-luna，另一个作为并行竞速的备胎
 CHAT_MODELS = ["gpt-6-luna", "gpt-5.6-luna", "gpt-6", "gpt-5.6"]
 CHAT_MODEL = os.environ.get("PANGEN_CHAT_MODEL", CHAT_MODELS[0])
+# 编排模型正常 4~10s 就有结果，25s 足够；竞速时超了立刻换人，绝不死等
+CHAT_TIMEOUT = 25
 
 # 参考图上限（前后端一致）
 MAX_REFS = 6
@@ -406,21 +409,63 @@ def _strip_vision(messages):
     return out
 
 
+def _chat_once(model, messages, timeout, vision_ok=True):
+    """单次编排调用，返回统一结构（不管成功失败）"""
+    t0 = time.time()
+    data, err = relay_chat(messages, None, timeout=timeout, model=model)
+    if err or not data or not data.get("choices"):
+        return {"model": model, "err": err or "对话接口返回为空", "plan": None,
+                "text": "", "vision": vision_ok, "cost": round(time.time() - t0, 1)}
+    text = ((data["choices"][0].get("message") or {}).get("content") or "").strip()
+    return {"model": model, "err": None, "plan": _extract_json(text), "text": text,
+            "vision": vision_ok, "cost": round(time.time() - t0, 1)}
+
+
 def chat_round(messages):
-    """带降级的对话调用：换模型 → 去多模态 → 再换模型。返回 (data, err, model, vision_ok)。"""
-    attempts = []
+    """并行竞速编排。
+
+    串行降级的毛病是必须等前面模型超时（最长上百秒）才轮到下一个；
+    这里同时问两个模型，谁先给出可用的结构化指令就用谁，最坏等待压到单次超时以内。
+    带参考图时，第二个模型走「无图版」请求，顺带覆盖读图不被支持的降级路径。
+    返回 {model, plan, text, vision, err, cost}
+    """
     multi = any(isinstance(m.get("content"), list) for m in messages)
-    for model in CHAT_MODELS[:3]:
-        attempts.append((model, messages, True))
-        if multi:
-            attempts.append((model, _strip_vision(messages), False))
-    last_err = ""
-    for model, msgs, vision_ok in attempts:
-        data, err = relay_chat(msgs, None, timeout=100, model=model)
-        if not err and data and data.get("choices"):
-            return data, None, model, vision_ok
-        last_err = err or "对话接口返回为空"
-    return None, last_err, CHAT_MODEL, True
+    plain = _strip_vision(messages) if multi else None
+
+    jobs = []
+    for i, model in enumerate(CHAT_MODELS[:2]):
+        use_plain = multi and i > 0
+        jobs.append((model, plain if use_plain else messages, not use_plain))
+
+    q = queue.Queue()
+
+    def worker(model, msgs, vision_ok):
+        try:
+            q.put(_chat_once(model, msgs, CHAT_TIMEOUT, vision_ok))
+        except Exception as e:
+            q.put({"model": model, "err": "请求异常: %s" % e, "plan": None,
+                   "text": "", "vision": vision_ok, "cost": 0})
+
+    for model, msgs, vok in jobs:
+        threading.Thread(target=worker, args=(model, msgs, vok), daemon=True).start()
+
+    deadline = time.time() + CHAT_TIMEOUT + 3
+    got, first = 0, None
+    while got < len(jobs):
+        remain = deadline - time.time()
+        if remain <= 0:
+            break
+        try:
+            r = q.get(timeout=remain)
+        except queue.Empty:
+            break
+        got += 1
+        if r.get("plan"):
+            return r
+        if first is None:
+            first = r
+    return first or {"model": CHAT_MODEL, "err": "编排模型无响应", "plan": None,
+                     "text": "", "vision": True, "cost": 0}
 
 
 def exec_plan(plan, client, img_model, img_files):
@@ -508,18 +553,20 @@ def run_chat(client, fields, img_files):
     else:
         messages.append({"role": "user", "content": message})
 
-    data, err, model_used, vision_ok = chat_round(messages)
-    sys.stderr.write("[chat] llm model=%s vision=%s err=%s\n"
-                     % (model_used, vision_ok, (err or "")[:120]))
-    if err:
-        return {"reply": "对话服务暂时不可用：%s" % err[:180], "images": [], "tasks": [],
-                "usage": q, "chat_model": CHAT_MODEL, "error": True}
-
-    text = (data["choices"][0].get("message") or {}).get("content") or ""
-    text = text.strip()
-    plan = _extract_json(text)
+    res = chat_round(messages)
+    text = (res.get("text") or "").strip()
+    plan = res.get("plan")
+    sys.stderr.write("[chat] winner=%s vision=%s plan=%s cost=%ss\n"
+                     % (res["model"], res.get("vision"),
+                        "y" if plan else "n", res.get("cost")))
     base = {"images": [], "tasks": [], "usage": quota_of(client),
-            "chat_model": model_used, "vision": vision_ok, "refs": len(img_files)}
+            "chat_model": res["model"], "vision": res.get("vision", True),
+            "refs": len(img_files)}
+
+    if not plan and not text:
+        base.update({"reply": "对话服务暂时不可用：%s" % (res.get("err") or "无响应")[:160],
+                     "error": True, "chat_model": CHAT_MODEL})
+        return base
 
     if not plan:
         # 模型没按格式回 —— 当成普通回答，不白扣额度
