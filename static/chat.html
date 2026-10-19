@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#534AB7">
+<title>Pangen Studio</title>
+<link rel="stylesheet" href="/static/chat.css">
+</head>
+<body>
+
+<header class="topbar">
+  <button class="menu-btn" id="menu-btn" aria-label="会话列表">☰</button>
+  <div class="brand">
+    <span class="logo">◐</span>
+    <div class="brand-name">Pangen Studio<small>IMAGE STUDIO</small></div>
+  </div>
+  <div class="top-right">
+    <span class="quota-chip" id="quota-chip"><i></i><b id="quota-used">–</b>/<span id="quota-limit">–</span> 今日</span>
+    <button class="icon-btn" id="who" title="当前口令">我</button>
+  </div>
+</header>
+
+<div class="body">
+  <aside class="sidebar" id="sidebar">
+    <button class="new-chat" id="new-chat">＋　新对话</button>
+    <div class="sessions" id="sessions"></div>
+    <div class="quota-card">
+      <div class="qc-head"><span>今日额度</span><b id="qc-num">– / –</b></div>
+      <div class="qc-bar" id="qc-bar"><i style="width:0%"></i></div>
+      <div class="qc-foot" id="qc-foot">额度每天 0 点重置</div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main">
+    <div class="stream" id="stream"><div class="stream-inner" id="stream-inner"></div></div>
+
+    <div class="composer" id="composer">
+      <div class="composer-inner">
+        <div class="refs" id="refs" hidden></div>
+        <div class="input-box" id="input-box">
+          <textarea id="input" rows="1" placeholder="描述画面，或发图让我改…"></textarea>
+          <div class="composer-bar">
+            <div class="left">
+              <button class="pill" id="add-ref" title="添加参考图">＋ 参考图 <span id="ref-count">0/6</span></button>
+              <button class="pill" id="pill-model"><span id="model-label">GPT-Image 2</span><span class="caret">▾</span></button>
+              <button class="pill" id="pill-size">1:1<span class="caret">▾</span></button>
+              <button class="pill" id="pill-count">1 张<span class="caret">▾</span></button>
+            </div>
+            <button class="send" id="send" aria-label="发送" disabled>↑</button>
+          </div>
+        </div>
+        <div class="hint-bar">Enter 发送 · Shift+Enter 换行 · 参考图最多 6 张</div>
+      </div>
+    </div>
+
+    <div class="pop" id="pop" hidden></div>
+  </main>
+</div>
+
+<input type="file" id="file-input" accept="image/*" multiple hidden>
+<div id="lightbox" hidden><img alt="预览大图"></div>
+
+<div id="gate" hidden>
+  <div class="gate-card">
+    <div class="mark">◐</div>
+    <h1>Pangen Studio</h1>
+    <p>请输入访问口令</p>
+    <input type="password" id="gate-code" placeholder="访问口令" autocomplete="off">
+    <button id="gate-submit" type="button">进入</button>
+    <div class="gate-err" id="gate-err"></div>
+  </div>
+</div>
+
+<script src="/static/chat.js"></script>
+</body>
+</html>
