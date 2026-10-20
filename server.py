@@ -346,7 +346,17 @@ def relay_request(path, body, headers, timeout=TIMEOUT, retries=3, deadline=0):
             sys.stderr.write("[relay] 换备用出网路径重试 %s\n" % path)
             continue
         break
-    return None, last
+    return None, _with_hint(last, deadline)
+
+
+def _with_hint(err, deadline):
+    """直连到大中转站丢包严重时，光说「超时」用户没法自救，补一句怎么办。"""
+    if PROXY_URL or NET_MODE == "proxy":
+        return err
+    low = str(err).lower()
+    if "超时" not in low and "timed out" not in low and "reset" not in low:
+        return err
+    return err + "（直连到中转站丢包严重，设置 PANGEN_PROXY 走代理可快 500 倍）"
 
 def relay_chat(messages, tools=None, timeout=150, model=None):
     """调用对话补全（OpenAI 兼容）。返回 (data, err)。"""
