@@ -155,6 +155,8 @@ def quota_block(client, n):
 # 2026-10-19 实测本机：直连基本可用（1.6~3.5s），系统代理 127.0.0.1:8337 多次整条挂死，
 # 所以代理只作兜底，不再当默认路径。
 NET_MODE = os.environ.get("PANGEN_NET_MODE", "auto").strip().lower()
+# 显式指定代理地址，留空则读系统 http(s)_proxy
+PROXY_URL = os.environ.get("PANGEN_PROXY", "").strip()
 _OPENER_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _OPENER_PROXY = urllib.request.build_opener()
 
@@ -179,18 +181,23 @@ def _route_order():
         return ["proxy"]
     if NET_MODE == "direct":
         return ["direct"]
-    return ["direct", "proxy"]
+    # 显式配了代理说明这机器上代理才是正路，优先用它；否则直连优先
+    return ["proxy", "direct"] if PROXY_URL else ["direct", "proxy"]
 
 # 连接复用：每次请求都重新做一次 TLS 握手，在抖动链路上就是一次次掷骰子
 # （实测握手 0.5s 到直接 60s 超时）。同一线程内复用连接，成功一次之后基本不用再握手。
 _TLS = threading.local()
 
 def _proxy_target():
-    try:
-        proxies = urllib.request.getproxies()
-    except Exception:
-        return None
-    raw = proxies.get("https") or proxies.get("http")
+    # PANGEN_PROXY 优先：环境变量里的代理未必是能用的那个
+    # （本机 http_proxy 指向沙箱 8337，实测整条挂死；Clash 在 7890，快 10 倍以上）
+    raw = PROXY_URL
+    if not raw:
+        try:
+            proxies = urllib.request.getproxies()
+        except Exception:
+            return None
+        raw = proxies.get("https") or proxies.get("http")
     if not raw:
         return None
     if "://" not in raw:
@@ -309,7 +316,8 @@ def relay_request(path, body, headers, timeout=TIMEOUT, retries=3, deadline=0):
                             conn.sock.settimeout(max(1.0, min(timeout, left)))
                         except Exception:
                             pass
-                        chunk = resp.read(65536)
+                        # read() 会阻塞攒满 64KB，慢流一停顿就卡死；read1 来多少收多少
+                        chunk = resp.read1(65536)
                         if not chunk:
                             break
                         buf += chunk
