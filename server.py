@@ -30,7 +30,8 @@ BASE_URL = "https://codex.pangen.dev/v1"
 API_KEY = os.environ.get("PANGEN_API_KEY", "")  # 必须通过环境变量提供，不硬编码
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-TIMEOUT = 300
+# 单次读写的 socket 超时；生图慢的时候可以临时放大（PANGEN_TIMEOUT=600）
+TIMEOUT = int(os.environ.get("PANGEN_TIMEOUT", "300"))
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
@@ -54,7 +55,13 @@ VISION_PREFER_THUMB = True
 MAX_REFS = 6
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024   # 单次请求体上限
 VISION_INLINE_LIMIT = 4 * 1024 * 1024  # 超过此体积的图不塞进多模态上下文
-IMAGE_DEADLINE = 420                   # 生图响应（几 MB base64）的最长下载时间
+# 生图响应（几 MB base64）的最长下载时间。上游回传慢时可以临时放大，
+# PANGEN_IMG_DEADLINE=2400 就是「宁可等半小时也别中断」
+IMAGE_DEADLINE = int(os.environ.get("PANGEN_IMG_DEADLINE", "420"))
+# 输出格式/质量。链路慢的时候把 base64 体积压下来比什么都管用：
+# jpeg + low 一般能把 2MB 级 PNG 压到 100~300KB。留空 = 用上游默认。
+IMG_FORMAT = os.environ.get("PANGEN_IMG_FORMAT", "").strip().lower()
+IMG_QUALITY = os.environ.get("PANGEN_IMG_QUALITY", "").strip().lower()
 
 # 多口令 + 每日限额：PANGEN_CODES="owner:CODE1:0,friend:CODE2:30"
 # 格式 标签:口令:每日张数（0=不限量）；label 为 owner 的口令可见并管理全部任务
@@ -278,6 +285,12 @@ def relay_request(path, body, headers, timeout=TIMEOUT, retries=3, deadline=0):
                 conn.sock.settimeout(timeout)    # 连上后换成读写超时
                 conn.request("POST", url_path, body=body, headers=hdr)
                 resp = conn.getresponse()
+                resp_t = time.time() - t0
+                if deadline:
+                    # 生图要区分「上游算得慢」和「响应下载慢」，两者解法完全相反
+                    sys.stderr.write("[relay] %s 响应头 %.1fs status=%s len=%s\n"
+                                     % (path, resp_t, resp.status,
+                                        resp.getheader("Content-Length") or "?"))
                 if resp.status >= 400:
                     detail = resp.read().decode("utf-8", errors="replace")[:300]
                     _drop_conn(kind)
@@ -286,14 +299,27 @@ def relay_request(path, body, headers, timeout=TIMEOUT, retries=3, deadline=0):
                     raw = resp.read()
                 else:
                     buf = bytearray()
+                    next_note = time.time() + 20
                     while True:
+                        # socket 超时不能超过剩余时限，否则流一停滞就要干等到 socket 超时
+                        left = hard_stop - time.time()
+                        if left <= 0:
+                            raise RuntimeError("下载超时：响应超过 %d 秒仍未传完" % deadline)
+                        try:
+                            conn.sock.settimeout(max(1.0, min(timeout, left)))
+                        except Exception:
+                            pass
                         chunk = resp.read(65536)
                         if not chunk:
                             break
                         buf += chunk
-                        if time.time() > hard_stop:
-                            raise RuntimeError("下载超时：响应超过 %d 秒仍未传完" % deadline)
+                        if time.time() >= next_note:
+                            next_note = time.time() + 20
+                            sys.stderr.write("[relay] %s 已下载 %d KB (%.0fs)\n"
+                                             % (path, len(buf) // 1024, time.time() - t0))
                     raw = bytes(buf)
+                    sys.stderr.write("[relay] %s 下载完成 %d KB (%.1fs, 首包 %.1fs)\n"
+                                     % (path, len(raw) // 1024, time.time() - t0, resp_t))
                 if resp.will_close:
                     _drop_conn(kind)
                 return json.loads(raw.decode("utf-8")), None
@@ -427,8 +453,12 @@ def run_generation(task_id, mode, fields, files=None, client_label=""):
         if mode == "t2i":
             payload = {"model": fields["model"], "prompt": fields["prompt"],
                        "size": fields.get("size", "auto"), "n": int(fields.get("n") or 1)}
-            if fields.get("quality"):
-                payload["quality"] = fields["quality"]
+            quality = fields.get("quality") or IMG_QUALITY
+            if quality:
+                payload["quality"] = quality
+            fmt = fields.get("output_format") or IMG_FORMAT
+            if fmt:
+                payload["output_format"] = fmt
             body = json.dumps(payload).encode("utf-8")
             data, err = relay_request("/images/generations", body,
                                       {"Content-Type": "application/json"},
@@ -437,8 +467,12 @@ def run_generation(task_id, mode, fields, files=None, client_label=""):
             mp_fields = {"model": fields["model"], "prompt": fields["prompt"],
                          "size": fields.get("size", "auto"),
                          "n": str(int(fields.get("n") or 1))}
-            if fields.get("quality"):
-                mp_fields["quality"] = fields["quality"]
+            quality = fields.get("quality") or IMG_QUALITY
+            if quality:
+                mp_fields["quality"] = quality
+            fmt = fields.get("output_format") or IMG_FORMAT
+            if fmt:
+                mp_fields["output_format"] = fmt
             relay_files = [("image[]", fn, data) for fn, data in files["images"]]
             if files.get("mask"):
                 relay_files.append(("mask", "mask.png", files["mask"]))
