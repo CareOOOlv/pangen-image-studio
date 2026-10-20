@@ -588,16 +588,18 @@ def chat_round(messages):
 
     串行降级的毛病是必须等前面模型超时（最长上百秒）才轮到下一个；
     这里同时问两个模型，谁先给出可用的结构化指令就用谁，最坏等待压到单次超时以内。
-    带参考图时，第二个模型走「无图版」请求，顺带覆盖读图不被支持的降级路径。
+
+    两路都带图（2026-10-20 改）：早先让备用模型走「无图版」以覆盖上游不支持读图的
+    情况，但无图版少传几十 KB、推理也轻，实测 4.2s 就返回，于是**每次都抢在带图版前面赢**
+    ——结果带图的请求实际由没看过图的模型在写 prompt。遇到「把左边那个花瓶换成蓝色」
+    这类指令就纯靠猜，prompt 方向一错，出图的钱白花。
+    现在两路都读图：某个模型不支持 vision 只会并行 400（不拖慢），
+    而「带图+文字」仍有「原话直接出图」的兜底，降级能力没丢。
     返回 {model, plan, text, vision, err, cost}
     """
     multi = any(isinstance(m.get("content"), list) for m in messages)
-    plain = _strip_vision(messages) if multi else None
 
-    jobs = []
-    for i, model in enumerate(CHAT_MODELS[:2]):
-        use_plain = multi and i > 0
-        jobs.append((model, plain if use_plain else messages, not use_plain))
+    jobs = [(model, messages, True) for model in CHAT_MODELS[:2]]
 
     timeout = VISION_TIMEOUT if multi else CHAT_TIMEOUT
     q = queue.Queue()
@@ -627,8 +629,19 @@ def chat_round(messages):
             return r
         if first is None:
             first = r
-    return first or {"model": CHAT_MODEL, "err": "编排模型无响应", "plan": None,
+
+    best = first or {"model": CHAT_MODEL, "err": "编排模型无响应", "plan": None,
                      "text": "", "vision": True, "cost": 0}
+    if multi and not best.get("plan"):
+        # 两路读图都没能给出指令 —— 可能上游整体不支持 vision。退回纯文字再问一次。
+        # 常规不会走到这里，所以多花的这点时间只在异常时出现。
+        try:
+            plain = _chat_once(CHAT_MODEL, _strip_vision(messages), CHAT_TIMEOUT, False)
+            if plain.get("plan"):
+                return plain
+        except Exception as e:
+            sys.stderr.write("[chat] 纯文字兜底也失败: %s\n" % e)
+    return best
 
 def exec_plan(plan, client, img_model, img_files):
     """按模型给的指令执行生图。返回 (task, err)。"""
