@@ -113,26 +113,119 @@ def upsert_task(task):
 # ---------- 用量统计（按口令标签每日计数） ----------
 USAGE_FILE = os.path.join(STORAGE_DIR, "usage.json")
 
+# 云托管 MinNum=0，实例闲下来就被回收，/tmp 跟着清空 —— 计数一归零，每日限额
+# 就形同虚设（重启一次又能刷满）。所以权威副本放 CloudBase 数据库，
+# 本地文件降级成缓存：连不上远端时仍能工作，只是失去跨实例持久性。
+USAGE_REMOTE_URL = os.environ.get("PANGEN_USAGE_URL", "").strip()
+USAGE_APIKEY = os.environ.get("CLOUDBASE_APIKEY", "").strip()
+_REMOTE_COOLDOWN = [0.0]  # 远端连续失败后静默 60s，避免每张图都白等超时
+
+
 def _today():
     return time.strftime("%Y-%m-%d")
 
-def load_usage():
+
+def _usage_local_get():
     try:
         with open(USAGE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
+
+def _usage_local_put(usage):
+    try:
+        with open(USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(usage, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        sys.stderr.write("[usage] local put fail: %s\n" % e)
+
+
+def _remote_get():
+    """返回 dict；远端可用但还没数据返回 {}；不可用返回 None。"""
+    if not (USAGE_REMOTE_URL and USAGE_APIKEY):
+        return None
+    if time.time() < _REMOTE_COOLDOWN[0]:
+        return None
+    try:
+        req = urllib.request.Request(
+            USAGE_REMOTE_URL,
+            headers={"Authorization": "Bearer " + USAGE_APIKEY,
+                     "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            doc = json.loads(r.read().decode("utf-8"))
+        return json.loads(doc.get("payload") or "{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:          # 文档还没建，等同空数据
+            return {}
+        _REMOTE_COOLDOWN[0] = time.time() + 60
+        sys.stderr.write("[usage] remote get HTTP %s\n" % e.code)
+        return None
+    except Exception as e:
+        _REMOTE_COOLDOWN[0] = time.time() + 60
+        sys.stderr.write("[usage] remote get fail: %s\n" % e)
+        return None
+
+
+def _remote_put(usage):
+    if not (USAGE_REMOTE_URL and USAGE_APIKEY):
+        return False
+    if time.time() < _REMOTE_COOLDOWN[0]:
+        return False
+    # 整个计数表塞进一个字符串字段：绕开 EJSON 的数字类型包装，
+    # 读回来 json.loads 一次就能用。
+    body = json.dumps({
+        "data": {"payload": json.dumps(usage, ensure_ascii=False),
+                 "updated": time.strftime("%Y-%m-%d %H:%M:%S")},
+        "upsert": True, "replaceMode": False}, ensure_ascii=False).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            USAGE_REMOTE_URL, data=body, method="PATCH",
+            headers={"Authorization": "Bearer " + USAGE_APIKEY,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            r.read()
+        return True
+    except Exception as e:
+        _REMOTE_COOLDOWN[0] = time.time() + 60
+        sys.stderr.write("[usage] remote put fail: %s\n" % e)
+        return False
+
+
+def _merge_usage(a, b):
+    """按 (日期, label) 取较大值 —— 远端写失败时本地可能更新，别让计数回退。"""
+    out = {d: dict(v) for d, v in (a or {}).items()}
+    for day, labels in (b or {}).items():
+        target = out.setdefault(day, {})
+        for label, n in (labels or {}).items():
+            try:
+                n = int(n)
+            except Exception:
+                continue
+            if n > int(target.get(label, 0) or 0):
+                target[label] = n
+    return out
+
+
+def load_usage():
+    local = _usage_local_get()
+    remote = _remote_get()
+    if remote is None:
+        return local
+    return _merge_usage(local, remote)
+
+
 def add_usage(label, n):
     with _lock:
         usage = load_usage()
         day_use = usage.get(_today(), {})
-        day_use[label] = day_use.get(label, 0) + n
+        day_use[label] = int(day_use.get(label, 0) or 0) + n
         usage[_today()] = day_use
         for k in sorted(usage.keys())[:-60]:  # 只保留最近 60 天
-            usage.pop(k)
-        with open(USAGE_FILE, "w", encoding="utf-8") as f:
-            json.dump(usage, f, ensure_ascii=False, indent=1)
+            usage.pop(k, None)
+        _usage_local_put(usage)
+        if not _remote_put(usage):
+            sys.stderr.write("[usage] 远端未写入，仅本地生效（实例重建会回退）\n")
 
 def quota_of(client):
     used = load_usage().get(_today(), {}).get(client["label"], 0)

@@ -68,15 +68,34 @@ if echo "$detail_env" | grep -q 'PANGEN_PROXY'; then
 fi
 echo "    ✔ 齐全，且没有 PANGEN_PROXY"
 
+# 额度持久化是可选增强：缺了不阻塞服务，但实例一回收、当天计数就归零，
+# 每日限额形同虚设。所以这里只告警，不拦。
+missing_q=""
+for k in PANGEN_USAGE_URL CLOUDBASE_APIKEY; do
+  echo "$detail_env" | grep -q "$k" || missing_q="$missing_q $k"
+done
+if [ -n "$missing_q" ]; then
+  echo "    ⚠ 未配置:$missing_q —— 额度只记在容器本地，实例回收后会清零"
+fi
+
 echo "==> 源码构建部署（产物走 CCR，不走 ghcr）"
 
 # 交互应答：第 1 个回车 = 灰度发布选 No；y = 有任务在跑时确认继续
+# 输出先落文件再回显：管道喂完输入后 CLI 退出常带 SIGPIPE(141)，
+# 光看退出码会把「已提交成功」误判成失败。
+LOGF="${TMPDIR:-/tmp}/pangen-deploy.log"
 (
   printf '\n'; sleep 3
   printf 'y\n'; sleep 2
   printf '\n\n\n'
-) | tcb cloudrun deploy -e "$ENV_ID" -s "$SERVICE" --source . --port "$PORT" --force
+) | tcb cloudrun deploy -e "$ENV_ID" -s "$SERVICE" --source . --port "$PORT" --force > "$LOGF" 2>&1
 rc=$?
+cat "$LOGF"
+
+if [ $rc -ne 0 ] && grep -q 'submission completed' "$LOGF"; then
+  echo "（已提交成功，忽略管道退出码 $rc）"
+  rc=0
+fi
 
 if [ $rc -ne 0 ]; then
   echo "!! 提交失败（exit $rc）" >&2
