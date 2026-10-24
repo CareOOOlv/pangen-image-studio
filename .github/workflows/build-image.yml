@@ -9,6 +9,23 @@ permissions:
   contents: read
   packages: write
 
+# 为什么同时推 CCR：
+#   云托管拉不动 ghcr.io 的镜像（会卡在「等待pod启动就绪」→ 超时 →
+#   DescribeVersion_internal_error_，这个报错是次生的，别被它骗）。
+#   CCR 是同机房仓库，实测能正常部署。
+#   所以 ghcr 只作备份，真正能部署的是 CCR 这一份。
+#
+# 需要在仓库 Settings → Secrets 里配两个（配了才推，没配自动跳过）：
+#   CCR_USERNAME  腾讯云容器镜像服务的用户名
+#   CCR_PASSWORD  对应的密码
+# 拿法：腾讯云控制台 → 容器镜像服务 → 个人版 → 访问凭证
+
+env:
+  CCR_REGISTRY: ccr.ccs.tencentyun.com
+  CCR_REPO: tcb-100049407292-vwzt/ca-ldzmafdl_pangen-image-studio
+  CCR_USERNAME: ${{ secrets.CCR_USERNAME }}
+  CCR_PASSWORD: ${{ secrets.CCR_PASSWORD }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,3 +45,27 @@ jobs:
           tags: |
             ghcr.io/careooolv/pangen-image-studio:latest
             ghcr.io/careooolv/pangen-image-studio:${{ github.sha }}
+
+      - name: Login CCR
+        if: env.CCR_PASSWORD != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.CCR_REGISTRY }}
+          username: ${{ env.CCR_USERNAME }}
+          password: ${{ env.CCR_PASSWORD }}
+
+      - name: Push to CCR
+        if: env.CCR_PASSWORD != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.CCR_REGISTRY }}/${{ env.CCR_REPO }}:latest
+            ${{ env.CCR_REGISTRY }}/${{ env.CCR_REPO }}:${{ github.sha }}
+
+      - name: CCR skipped notice
+        if: env.CCR_PASSWORD == ''
+        run: |
+          echo "::warning::CCR_USERNAME / CCR_PASSWORD 未配置，本次只推了 ghcr。"
+          echo "ghcr 的镜像云托管拉不动，部署请用 ./deploy.sh（--source 源码构建）。"
