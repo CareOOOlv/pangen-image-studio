@@ -260,6 +260,7 @@
         <div class="avatar">◐</div>
         <div class="assistant-body">
           ${m.text ? '<div class="bubble">' + esc(m.text) + '</div>' : ''}
+          ${m.pending ? noticeHTML('run', '正在生成', '大约 1~3 分钟，好了会自动出现，不用等在这里') : ''}
           ${m.error ? noticeHTML('err', '生成失败', m.error) : ''}
           ${m.quota ? noticeHTML('run', '额度不足', m.quota) : ''}
           ${(m.images || []).length ? resultHTML(m) : ''}
@@ -564,6 +565,43 @@
     state.abort?.abort();
   }
 
+  /* 轮询后台任务。云端网关 60s 就断连接，图要 1~3 分钟才好，
+     所以请求返回的是 task_id，结果靠这里捞回来。 */
+  async function pollTask(taskId, msg) {
+    const deadline = Date.now() + 8 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2500));
+      let data;
+      try {
+        const r = await api('/api/tasks', {});
+        if (r.status === 401) { msg.pending = false; msg.error = '口令已失效，请重新输入'; renderStream(); showGate('口令已失效，请重新输入'); return; }
+        if (!r.ok) continue;
+        data = await r.json();
+      } catch (e) {
+        continue;   // 网络抖一下就继续等，别把好好的任务判死
+      }
+      const t = (data.tasks || []).find((x) => x.id === taskId);
+      if (!t || t.status === 'running') continue;
+
+      msg.pending = false;
+      if (t.status === 'done') {
+        msg.images = t.images || [];
+        msg.meta = { model: t.model, size: t.size, duration: t.duration, prompt: t.prompt || '' };
+        if (!msg.text) msg.text = '已生成 ' + msg.images.length + ' 张，看看效果。';
+      } else {
+        msg.error = t.error || '生成失败，请稍后重试';
+      }
+      saveSessions();
+      renderStream();
+      refreshUsage();
+      return;
+    }
+    msg.pending = false;
+    msg.error = '等太久了，先停止等待。图可能还在生成，稍后可以在任务记录里看看。';
+    saveSessions();
+    renderStream();
+  }
+
   async function send(textOverride) {
     if (state.busy) return;
     const text = (textOverride ?? $('input').value).trim();
@@ -606,6 +644,9 @@
     fd.append('size', state.size);
     fd.append('n', String(state.count));
     fd.append('history', JSON.stringify(history));
+    // 云端网关 60s 就掐连接，而生图要 1~3 分钟：让后端拿到 task_id 立刻返回，
+    // 出图丢后台线程，这边轮询 /api/tasks。不带这个参数就是老的同步模式。
+    fd.append('async', '1');
     refs.forEach((r, i) => fd.append('images', r.blob, 'ref-' + (i + 1) + '.jpg'));
     refs.forEach((r, i) => { if (r.read) fd.append('thumbs', r.read, 'read-' + (i + 1) + '.jpg'); });
 
@@ -650,6 +691,11 @@
         }
         s.messages.push(msg);
         if (data.usage) state.usage = data.usage;
+        if (data.pending && t && t.id) {
+          msg.pending = true;
+          renderStream();
+          pollTask(t.id, msg);   // 不 await：让它自己跑，用户可以继续发消息
+        }
       }
       renderQuota();
     } catch (e) {

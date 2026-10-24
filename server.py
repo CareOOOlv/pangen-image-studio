@@ -736,8 +736,13 @@ def chat_round(messages):
             sys.stderr.write("[chat] 纯文字兜底也失败: %s\n" % e)
     return best
 
-def exec_plan(plan, client, img_model, img_files):
-    """按模型给的指令执行生图。返回 (task, err)。"""
+def exec_plan(plan, client, img_model, img_files, background=False):
+    """按模型给的指令执行生图。返回 (task, err)。
+
+    background=True 时立刻返回一个 status=running 的占位任务，真正的生成丢后台线程。
+    云端必须这么干：公网网关 60s 就掐连接，而一次生图实测 60~160s，
+    同步等必然 504 —— 服务端没挂，只是客户端先被踢了。
+    """
     prompt = (plan.get("prompt") or "").strip()
     if not prompt:
         return None, "模型没有给出有效的 prompt"
@@ -759,11 +764,31 @@ def exec_plan(plan, client, img_model, img_files):
         fields["quality"] = plan["quality"]
 
     task_id = uuid.uuid4().hex[:12]
-    if action == "edit" and img_files:
-        return run_generation(task_id, "i2i", fields,
-                              {"images": img_files[:MAX_REFS]},
-                              client_label=client["label"]), None
-    return run_generation(task_id, "t2i", fields, client_label=client["label"]), None
+    is_edit = (action == "edit" and img_files)
+    mode = "i2i" if is_edit else "t2i"
+    files_arg = {"images": img_files[:MAX_REFS]} if is_edit else None
+
+    if background:
+        def _bg():
+            try:
+                run_generation(task_id, mode, fields, files_arg,
+                               client_label=client["label"])
+            except Exception as e:
+                sys.stderr.write("[chat] 后台生成异常: %s\n" % e)
+                upsert_task({"id": task_id, "mode": mode, "status": "error",
+                             "client": client["label"], "created_at": time.time(),
+                             "prompt": prompt, "model": img_model,
+                             "size": size, "quality": fields.get("quality", ""),
+                             "n": n, "error": str(e)[:200]})
+        threading.Thread(target=_bg, daemon=True).start()
+        sys.stderr.write("[chat] 异步生成已排入后台 task=%s mode=%s\n" % (task_id, mode))
+        return {"id": task_id, "mode": mode, "status": "running",
+                "client": client["label"], "created_at": time.time(),
+                "prompt": prompt, "model": img_model, "size": size,
+                "quality": fields.get("quality", ""), "n": n}, None
+
+    return run_generation(task_id, mode, fields, files_arg,
+                          client_label=client["label"]), None
 
 def run_chat(client, fields, img_files, vision_files=None):
     """一轮对话：LLM 决策 →（需要时）执行生图 → 返回文案与图片。"""
@@ -859,7 +884,11 @@ def run_chat(client, fields, img_files, vision_files=None):
         base.update({"reply": reply or text or "你想让我怎么改？", "action": "answer"})
         return base
 
-    task, terr = exec_plan(plan, client, img_model, img_files)
+    # 前端可显式要求异步（async=1）：先拿 task_id 立刻返回，再轮询 /api/tasks。
+    # 缺省仍是同步，不改变其他调用方（比如她那边的 skill）的行为。
+    want_async = str(fields.get("async") or "").strip().lower() in ("1", "true", "yes")
+
+    task, terr = exec_plan(plan, client, img_model, img_files, background=want_async)
     if terr:
         base.update({"reply": terr, "action": "blocked", "quota": True,
                      "usage": quota_of(client)})
@@ -867,6 +896,12 @@ def run_chat(client, fields, img_files, vision_files=None):
 
     base["tasks"] = [task]
     base["action"] = action
+    if task.get("status") == "running":
+        base["pending"] = True
+        # 这里不给兜底文案：前端会用「正在生成」占位条，避免两句话叠在一起
+        base["reply"] = reply
+        base["usage"] = quota_of(client)
+        return base
     if task.get("status") == "done" and task.get("images"):
         base["images"] = task["images"]
         if reply:
