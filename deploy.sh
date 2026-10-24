@@ -43,6 +43,31 @@ echo "==> 目标环境 $ENV_ID · 服务 $SERVICE · 端口 $PORT"
 
 PREV_VER="$(online_version)"
 [ -n "$PREV_VER" ] && echo "==> 当前线上版本 $PREV_VER"
+
+# 环境变量体检：这四项缺了不会报错，但会静默出问题
+#   PANGEN_API_KEY  缺了 → 所有出图 401
+#   PANGEN_CODES    缺了 → 朋友口令会被当成 owner，无限量且不可见
+#   STORAGE_DIR     缺了 → 落到镜像内路径，容器重建即丢
+#   PANGEN_CHAT_MODEL 缺了 → 用默认模型，行为可能变
+# deploy 只会 merge 服务级 EnvParams，所以这里查的是服务级配置。
+echo "==> 检查服务级环境变量"
+detail_env="$(tcb cloudrun detail -e "$ENV_ID" -s "$SERVICE" --json 2>/dev/null)"
+missing=""
+for k in PANGEN_API_KEY PANGEN_CODES STORAGE_DIR PANGEN_CHAT_MODEL; do
+  echo "$detail_env" | grep -q "$k" || missing="$missing $k"
+done
+if [ -n "$missing" ]; then
+  echo "!! 服务级配置缺:$missing" >&2
+  echo "   补法：tcb api tcbr UpdateCloudRunServerConfig --api-version 2022-02-17 --body '<JSON>'" >&2
+  echo "   改完必须再 deploy 一次才生效。" >&2
+  exit 1
+fi
+if echo "$detail_env" | grep -q 'PANGEN_PROXY'; then
+  echo "!! 服务级配置里有 PANGEN_PROXY —— 云端机房直连 Cloudflare 路径短，设了反而会挂" >&2
+  exit 1
+fi
+echo "    ✔ 齐全，且没有 PANGEN_PROXY"
+
 echo "==> 源码构建部署（产物走 CCR，不走 ghcr）"
 
 # 交互应答：第 1 个回车 = 灰度发布选 No；y = 有任务在跑时确认继续
